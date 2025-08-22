@@ -12,6 +12,13 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+# === OCR paden via omgevingsvariabelen ===
+TESSERACT_PATH = os.environ.get("TESSERACT_PATH", "/usr/bin/tesseract")
+POPPLER_PATH   = os.environ.get("POPPLER_PATH") or os.environ.get("POPLER_PATH") or "/usr/bin"
+
+# laat pytesseract dit pad gebruiken
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
 def clean_ocr_noise(s: str) -> str:
     if not s:
         return s
