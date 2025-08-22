@@ -1,0 +1,9 @@
+streamlit
+pandas
+openpyxl
+pdfplumber
+pdf2image
+pytesseract
+Pillow
+xlsxwriter
+office365-sharepoint
