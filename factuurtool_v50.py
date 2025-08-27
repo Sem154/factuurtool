@@ -238,7 +238,7 @@ def ocr_extract_regels_en_codes(pdf_path, poppler_path):
     regels = tekst.splitlines()
     raw_codes = re.findall(r"[0-9][0-9\s\-\.]{4,}[0-9]", tekst)
     norm_codes = [re.sub(r"\D", "", c).lstrip("0") for c in raw_codes]
-    unieke_codes = sorted({c for c in norm_codes if 6 <= len(c) <= 10})
+    unieke_codes = sorted({c for c in norm_codes if 5 <= len(c) <= 12})
     return regels, unieke_codes
 
 
@@ -695,9 +695,31 @@ def process_pdf_path(path: str, prijzenboek, prijs_codes_norm, aggregeer_per_taa
     else:
         alle_teksten = "\n".join(regels_gevonden)
         raw_codes = re.findall(r"[0-9][0-9\s\-\.]{4,}[0-9]", alle_teksten)
-        ocr_codes = [normalize_code(c) for c in raw_codes if 6 <= len(normalize_code(c)) <= 10]
+        ocr_codes = [normalize_code(c) for c in raw_codes if 5 <= len(normalize_code(c)) <= 12]
 
     gevonden_codes = sorted(set(ocr_codes))
+
+    # Bouw per-regel features zodat elke factuurregel zichtbaar wordt in een apart overzicht
+    alle_regels_rows = []
+    per_line_codes = []
+    for idx, regel in enumerate(regels_gevonden):
+        line_raw_codes = re.findall(r"[0-9][0-9\s\-\.]{4,}[0-9]", regel or "")
+        line_codes = [normalize_code(c) for c in line_raw_codes if 5 <= len(normalize_code(c)) <= 12]
+        per_line_codes.append(set(line_codes))
+        triples = extract_bedragen_with_flags(regel)
+        bedragen_vals = [v for (v, _e, _u) in triples]
+        qtys = extract_qty_candidates(regel)
+        alle_regels_rows.append({
+            "Bestandsnaam": os.path.basename(path),
+            "Factuurnummer": factuurnummer,
+            "Regel_index": idx,
+            "Regel": regel,
+            "Codes_op_regel": ", ".join(sorted(set(line_codes))) if line_codes else None,
+            "Bedragen_gevonden": ", ".join(str(b) for b in bedragen_vals) if bedragen_vals else None,
+            "Qty_candidates": ", ".join(str(q) for q in qtys) if qtys else None,
+            "Bevat_taakcode": bool(line_codes),
+            "Verwerkingsmethode": "OCR" if gebruikte_ocr else "PDF-tabel",
+        })
 
     # Bouw alle_teksten en bepaal factuurnummer op basis van de inhoud
     alle_teksten = "\n".join(regels_gevonden)
@@ -861,7 +883,46 @@ def process_pdf_path(path: str, prijzenboek, prijs_codes_norm, aggregeer_per_taa
                     "Regels": regel,
                     "Verwerkingsmethode": "OCR" if gebruikte_ocr else "PDF-tabel",
                 })
-    return rows
+    # === Voeg regels ZONDER taakcode toe ===
+    # Selecteer regels waar geen code op de regel is gedetecteerd
+    lines_with_any_code = {i for i, cs in enumerate(per_line_codes) if cs}
+    for idx, regel in enumerate(regels_gevonden):
+        if idx in lines_with_any_code:
+            continue
+        if not regel:
+            continue
+        bedragen = extract_bedragen(regel)
+        qty_candidates = extract_qty_candidates(regel)
+        prijs_op_regel = select_regel_bedrag(regel, bedragen)
+        try:
+            prijs_val = float(prijs_op_regel) if prijs_op_regel is not None else None
+        except Exception:
+            prijs_val = None
+        # Alleen toevoegen als er iets nuttigs staat (bedrag of kwantiteit)
+        if prijs_val is None and not qty_candidates:
+            continue
+        try:
+            aantal_unknown = float(qty_candidates[0]) if qty_candidates else 1.0
+        except Exception:
+            aantal_unknown = 1.0
+        rows.append({
+            "Bestandsnaam": os.path.basename(path),
+            "Factuurnummer": factuurnummer,
+            "Taakcode_gevonden": None,
+            "Taakcode": None,
+            "Fuzzy_score": None,
+            "Aantal (geschat)": aantal_unknown,
+            "Omschrijving": None,
+            "Totaalprijs boek": None,
+            "Verwacht bedrag": None,
+            "Prijs op factuur (som)": prijs_val,
+            "Afwijking": None,
+            "Status": "⚠️ Geen taakcode",
+            "Regels": regel,
+            "Verwerkingsmethode": "OCR" if gebruikte_ocr else "PDF-tabel",
+        })
+
+    return rows, alle_regels_rows
 
 # ========== Hoofdlogica: bron ophalen en verwerken ==========
 
@@ -922,6 +983,7 @@ if should_scan:
     total = len(paths)
     progress = st.progress(0, text="Start met verwerken…")
     all_rows = []
+    all_line_rows = []
 
     for idx, path in enumerate(paths):
         try:
@@ -935,7 +997,7 @@ if should_scan:
                     progress.progress(int(((idx + 1) / max(1, total)) * 100), text=f"Overgeslagen (reeds verwerkt): {os.path.basename(path)}")
                     continue
 
-            rows = process_pdf_path(
+            rows, per_line_rows = process_pdf_path(
                 path,
                 prijzenboek,
                 prijs_codes_norm,
@@ -945,6 +1007,7 @@ if should_scan:
                 fuzzy_threshold=fuzzy_threshold
             )
             all_rows.extend(rows)
+            all_line_rows.extend(per_line_rows)
 
             if source != "Upload":
                 try:
@@ -956,8 +1019,14 @@ if should_scan:
         except Exception as e:
             st.warning(f"Fout bij verwerken van {os.path.basename(path)}: {e}")
 
-    if all_rows:
-        resultaat_df = pd.DataFrame(all_rows)
+    if all_rows or all_line_rows:
+        resultaat_df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame(columns=[
+            "Bestandsnaam","Factuurnummer","Taakcode_gevonden","Taakcode","Fuzzy_score","Aantal (geschat)",
+            "Omschrijving","Totaalprijs boek","Verwacht bedrag","Prijs op factuur (som)","Afwijking","Status","Regels","Verwerkingsmethode"
+        ])
+        alle_regels_df = pd.DataFrame(all_line_rows) if all_line_rows else pd.DataFrame(columns=[
+            "Bestandsnaam","Factuurnummer","Regel_index","Regel","Codes_op_regel","Bedragen_gevonden","Qty_candidates","Bevat_taakcode","Verwerkingsmethode"
+        ])
 
                 # Normaliseer numerieke kolommen naar float voor Pandas/Excel
         for _col in ["Totaalprijs boek","Verwacht bedrag","Prijs op factuur (som)","Afwijking","Aantal (geschat)","Fuzzy_score"]:
@@ -979,10 +1048,18 @@ if should_scan:
         )
         st.markdown("## 📊 Resultaten")
         # Maak tabs voor overzicht, afwijkingen en factuuroverzicht en export
-        tabs = st.tabs(["✅ Binnen marge", "❌ Afwijkingen & Overig", "🧾 Factuur overzicht", "📥 Export"])
+        tabs = st.tabs(["📄 Alle regels", "✅ Binnen marge", "❌ Afwijkingen & Overig", "🧾 Factuur overzicht", "📥 Export"])
 
         # Binnen marge
         with tabs[0]:
+            st.data_editor(
+                alle_regels_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="alle_regels",
+            )
+        # Binnen marge
+        with tabs[1]:
             st.data_editor(
                 resultaat_df[resultaat_df["Status"] == "✅ Binnen marge"],
                 num_rows="dynamic",
@@ -990,7 +1067,7 @@ if should_scan:
                 key="binnen_marge",
             )
         # Afwijkingen
-        with tabs[1]:
+        with tabs[2]:
             st.data_editor(
                 resultaat_df[resultaat_df["Status"] != "✅ Binnen marge"],
                 num_rows="dynamic",
@@ -998,7 +1075,7 @@ if should_scan:
                 key="afwijkingen",
             )
         # Factuuroverzicht
-        with tabs[2]:
+        with tabs[3]:
             st.data_editor(
                 factuur_summary,
                 num_rows="dynamic",
@@ -1006,12 +1083,14 @@ if should_scan:
                 key="factuur_overzicht",
             )
         # Export tab
-        with tabs[3]:
+        with tabs[4]:
             buffer = BytesIO()
             with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
                 resultaat_df.to_excel(writer, index=False, sheet_name="Resultaten")
                 # voeg factuuroverzicht toe als aparte sheet
                 factuur_summary.to_excel(writer, index=False, sheet_name="Factuur overzicht")
+                # voeg alle regels sheet toe
+                alle_regels_df.to_excel(writer, index=False, sheet_name="Alle regels")
             st.download_button(
                 label="📥 Download resultaten als Excel",
                 data=buffer.getvalue(),
