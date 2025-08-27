@@ -11,6 +11,8 @@ import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+import platform
+import shutil
 
 def clean_ocr_noise(s: str) -> str:
     if not s:
@@ -34,10 +36,21 @@ except Exception:
     _SP_OK = False
 
 # === INSTELLINGEN ===
-# (Aangepast voor Sem)
+# (Aangepast voor Sem) – maak paden OS-agnostisch en veilig
 TESSERACT_PATH = r"C:\Users\Sem Kosse\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
-POPLER_PATH = r"C:\poppler\poppler-24.08.0\Library\bin"  # pas aan naar je eigen poppler-pad indien nodig
-pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+POPLER_PATH = r"C:\poppler\poppler-24.08.0\Library\bin"  # Windows-poppler pad, val terug naar None als niet aanwezig
+
+# Kies tesseract bin: op Windows het vaste pad als het bestaat; anders via PATH als beschikbaar
+if os.name == "nt" and os.path.exists(TESSERACT_PATH):
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+else:
+    auto_tesseract = shutil.which("tesseract")
+    if auto_tesseract:
+        pytesseract.pytesseract.tesseract_cmd = auto_tesseract
+
+# Alleen een poppler_path meegeven als het pad bestaat (voorkomt fouten op Linux/macOS)
+if not (os.name == "nt" and os.path.isdir(POPLER_PATH)):
+    POPLER_PATH = None
 
 # Pas de paginatitel aan naar huidige versie
 # Update de paginatitel voor versie v49
@@ -216,12 +229,15 @@ def extract_factuurnummer(tekst: str, filename: str = "") -> str:
 
 def ocr_extract_regels_en_codes(pdf_path, poppler_path):
     tekst = ""
-    images = convert_from_path(pdf_path, dpi=200, fmt="png", poppler_path=poppler_path)
+    if poppler_path:
+        images = convert_from_path(pdf_path, dpi=200, fmt="png", poppler_path=poppler_path)
+    else:
+        images = convert_from_path(pdf_path, dpi=200, fmt="png")
     for image in images:
         tekst += pytesseract.image_to_string(image, config="--psm 6")
     regels = tekst.splitlines()
-    raw_codes = re.findall(r"[0-9][0-9\\s\\-\\.]{4,}[0-9]", tekst)
-    norm_codes = [re.sub(r"\\D", "", c).lstrip("0") for c in raw_codes]
+    raw_codes = re.findall(r"[0-9][0-9\s\-\.]{4,}[0-9]", tekst)
+    norm_codes = [re.sub(r"\D", "", c).lstrip("0") for c in raw_codes]
     unieke_codes = sorted({c for c in norm_codes if 6 <= len(c) <= 10})
     return regels, unieke_codes
 
@@ -499,22 +515,10 @@ def choose_line_amount(regel: str, unit_price: float, max_rel_err: float = 0.08,
             if best[2] is None or err < best[2]:
                 best = (round(q_inf, 2), b, err)
     return best
-    # 2) Geen expliciete aantallen: alleen infereren uit bedrag ALS er een € in de regel staat
-    if has_euro_anywhere:
-        for b in bedragen_filt:
-            q_inf = b / float(unit_price)
-            if q_inf <= 0:
-                continue
-            err = abs(b - q_inf * float(unit_price))
-            rel = err / max(1.0, abs(b))
-            if err <= max_abs_err or rel <= max_rel_err:
-                if best[2] is None or err < best[2]:
-                    best = (round(q_inf, 2), b, err)
-    return best
 # === Fuzzy matching helpers ===
 
 def normalize_code(s: str) -> str:
-    return re.sub(r"\\D", "", str(s)).lstrip("0")
+    return re.sub(r"\D", "", str(s)).lstrip("0")
 
 def build_prijzenboek_lookup(prijzenboek: pd.DataFrame):
     prijzenboek = prijzenboek.copy()
@@ -689,8 +693,8 @@ def process_pdf_path(path: str, prijzenboek, prijs_codes_norm, aggregeer_per_taa
         gebruikte_ocr = True
         regels_gevonden, ocr_codes = ocr_extract_regels_en_codes(tmp_pdf_path, poppler_path=POPLER_PATH)
     else:
-        alle_teksten = "\\n".join(regels_gevonden)
-        raw_codes = re.findall(r"[0-9][0-9\\s\\-\\.]{4,}[0-9]", alle_teksten)
+        alle_teksten = "\n".join(regels_gevonden)
+        raw_codes = re.findall(r"[0-9][0-9\s\-\.]{4,}[0-9]", alle_teksten)
         ocr_codes = [normalize_code(c) for c in raw_codes if 6 <= len(normalize_code(c)) <= 10]
 
     gevonden_codes = sorted(set(ocr_codes))
@@ -715,7 +719,7 @@ def process_pdf_path(path: str, prijzenboek, prijs_codes_norm, aggregeer_per_taa
 
     rows = []
     for found_code, matched_code in code_map.items():
-        relevante_regels = [r for r in regels_gevonden if re.sub(r"\\D", "", r).find(found_code) != -1 or found_code in r]
+        relevante_regels = [r for r in regels_gevonden if re.sub(r"\D", "", r).find(found_code) != -1 or found_code in r]
         prijsregels = prijzenboek[prijzenboek["Taakcode_norm"] == matched_code]
         gecombineerde_prijs = prijsregels["Koopprijs (ex BTW)"].sum()
 
@@ -865,24 +869,29 @@ def get_pdf_paths_from_source(source, pdf_files, local_folder, sharepoint_info):
     paths = []
     if source == "Upload":
         # Schrijf geüploade bestanden tijdelijk weg met behoud van de oorspronkelijke bestandsnaam.
-        # Hierdoor wordt de originele naam zichtbaar in het resultaat in plaats van een willekeurige tmp-naam.
+        # Lees de upload één keer in geheugen om lege writes door herhaald f.read() te voorkomen.
         for f in (pdf_files or []):
             try:
                 original_name = os.path.basename(getattr(f, "name", "upload.pdf"))
             except Exception:
                 original_name = "upload.pdf"
-            # Sla op in de standaard temp directory met de originele naam. Gebruik dezelfde naam zodat basename zichtbaar is.
+            try:
+                data = f.getvalue() if hasattr(f, "getvalue") else f.read()
+            except Exception:
+                # laatste redmiddel
+                try:
+                    f.seek(0)
+                    data = f.read()
+                except Exception:
+                    data = b""
             tmp_dir = tempfile.gettempdir()
             tmp_path = os.path.join(tmp_dir, original_name)
-            # Bewaar de inhoud van de upload naar dit pad
             try:
-                # Schrijf het bestand weg; overschrijf eventueel bestaand bestand met dezelfde naam
                 with open(tmp_path, "wb") as out:
-                    out.write(f.read())
+                    out.write(data)
             except Exception:
-                # fallback naar NamedTemporaryFile indien schrijven mislukt
                 with tempfile.NamedTemporaryFile(delete=False, suffix="_" + original_name) as tmp:
-                    tmp.write(f.read())
+                    tmp.write(data)
                     tmp_path = tmp.name
             paths.append(tmp_path)
     elif source == "Lokale map":
